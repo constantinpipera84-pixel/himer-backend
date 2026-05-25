@@ -1,12 +1,16 @@
 {
-  "name": "himer-grid",
-  "version": "1.0.0",
-  "main": "himer-server.js",
+  "name": "himer-orchestrator",
+  "version": "2.0.0",
+  "description": "HIMER Neural Grid - DePIN Orchestrator with notifications & ad tracking",
+  "main": "server.js",
   "scripts": {
-    "start": "node himer-server.js"
+    "start": "node server.js",
+    "dev": "node server.js"
   },
   "dependencies": {
-    "ws": "^8.18.0",
-    "@supabase/supabase-js": "^2.48.1"
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
