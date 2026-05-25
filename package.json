@@ -1,11 +1,10 @@
 {
   "name": "himer-orchestrator",
-  "version": "2.0.0",
-  "description": "HIMER Neural Grid - DePIN Orchestrator with notifications & ad tracking",
+  "version": "3.0.0",
+  "description": "HIMER Neural Grid v3 - DePIN with real payouts, milestones, AI assistant",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "ws": "^8.18.0"
