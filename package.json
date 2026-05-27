@@ -1,13 +1,16 @@
 {
   "name": "himer-orchestrator",
-  "version": "3.0.0",
-  "description": "HIMER Neural Grid v3 - DePIN with real payouts, milestones, AI assistant",
+  "version": "4.0.0",
+  "description": "HIMER Neural Grid v4 — DePIN with Supabase, admin auth, payouts, business clients",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "@supabase/supabase-js": "^2.45.4",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2"
   },
   "engines": {
     "node": ">=18"
