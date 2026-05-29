@@ -117,6 +117,11 @@ async function handle(req, res, url, body, helpers) {
         done: metrics.jobsCompleted,
       },
       pendingPayoutCount,
+      // Flat fields for Owner Mode dashboard
+      revenueToday: await sumRevenueSince(startOfTodayISO()),
+      revenueMonth: await sumRevenueSince(startOfMonthISO()),
+      totalIn: treasury.totalIn,
+      activeClients: await countActiveClients(),
     });
   }
 
@@ -232,6 +237,114 @@ async function handle(req, res, url, body, helpers) {
   // ============================================================
   // CREATE CLIENT
   // ============================================================
+  // ============================================================
+  // PLATFORM SETTINGS (contacts) — GET / SET
+  // ============================================================
+  if (route === 'GET /api/admin/settings') {
+    const session = await requireAdmin(req, res, json);
+    if (!session) return true;
+    const rows = await dbList('himer_settings', {});
+    const map = {};
+    for (const s of rows) map[s.key] = s.value;
+    return json(res, { settings: map });
+  }
+
+  if (route === 'POST /api/admin/settings') {
+    const session = await requireAdmin(req, res, json);
+    if (!session) return true;
+    if (session.mustChange) return json(res, { error: 'Change password first' }, 403);
+    const updates = body.settings || {};
+    const { dbUpsert } = require('../lib/db');
+    for (const [key, value] of Object.entries(updates)) {
+      await dbUpsert('himer_settings', { key, value: String(value), updated_at: new Date().toISOString() }, 'key');
+    }
+    await logAdminAction(session.admin.id, 'settings_updated', 'settings', 'contacts', ip, updates);
+    return json(res, { ok: true, updated: Object.keys(updates).length });
+  }
+
+  // ============================================================
+  // OWNER: submit compute job WITHOUT api key (admin authenticated)
+  // ============================================================
+  if (route === 'POST /api/admin/owner/job') {
+    const session = await requireAdmin(req, res, json);
+    if (!session) return true;
+    const { submitJob } = require('../lib/jobs');
+    // Find or create owner client
+    let ownerClient = (await dbList('himer_clients', { where: { is_owner: true } }))[0];
+    if (!ownerClient) {
+      const { createClient } = require('../lib/business');
+      const created = await createClient({
+        name: 'HIMER Owner', email: (process.env.INITIAL_ADMIN_EMAIL || 'himer.nodes@gmail.com').toLowerCase(),
+        company: 'HIMER', plan: 'owner', isOwner: true,
+      });
+      ownerClient = created.client;
+    }
+    const requiredGflops = parseFloat(body.required_gflops_seconds || body.gflops || 0);
+    if (!requiredGflops || requiredGflops <= 0) return json(res, { error: 'required_gflops_seconds must be > 0' }, 400);
+    let input_data = body.input_data || {};
+    const job = await submitJob({
+      client: ownerClient,
+      jobType: body.job_type || 'compute',
+      jobName: body.name || 'Owner job',
+      inputData: input_data,
+      requiredGflops,
+      requiredRamGb: parseFloat(body.required_ram_gb || 1),
+      requiredBwMbps: parseFloat(body.required_bw_mbps || 1),
+    });
+    await logAdminAction(session.admin.id, 'owner_job_submitted', 'job', job.id, ip, { gflops: requiredGflops });
+    return json(res, { ok: true, job_id: job.id, status: job.status, message: 'Owner job queued (free).' });
+  }
+
+  // OWNER: list owner jobs (no api key)
+  if (route === 'GET /api/admin/owner/jobs') {
+    const session = await requireAdmin(req, res, json);
+    if (!session) return true;
+    const { listJobs } = require('../lib/jobs');
+    const jobsList = await listJobs({ ownerOnly: true, limit: 30 });
+    return json(res, {
+      jobs: jobsList.map(j => ({
+        id: j.id, name: j.job_name, type: j.job_type, status: j.status,
+        required_gflops: j.required_gflops_seconds, actual_gflops: j.actual_gflops_seconds,
+        created_at: j.created_at, completed_at: j.completed_at,
+      })),
+    });
+  }
+
+  // SIGNUP REQUESTS — list pending API key requests
+  if (route === 'GET /api/admin/signup-requests') {
+    const session = await requireAdmin(req, res, json);
+    if (!session) return true;
+    const reqs = await dbList('himer_signup_requests', { orderBy: 'created_at', desc: true, limit: 100 });
+    return json(res, { requests: reqs });
+  }
+
+  // REVENUE BREAKDOWN — admin sees all revenue streams (compute, premium, ads, affiliate)
+  if (route === 'GET /api/admin/revenue/breakdown') {
+    const session = await requireAdmin(req, res, json);
+    if (!session) return true;
+    const { getRevenueBreakdown } = require('../lib/monetization');
+    const period = (url.searchParams && url.searchParams.get('period')) || 'month';
+    let since;
+    const now = new Date();
+    if (period === 'today') { since = new Date(now); since.setHours(0,0,0,0); }
+    else if (period === 'month') since = new Date(now.getFullYear(), now.getMonth(), 1);
+    else if (period === 'year') since = new Date(now.getFullYear(), 0, 1);
+    else since = null;
+    const breakdown = await getRevenueBreakdown(since ? since.toISOString() : null);
+    return json(res, breakdown);
+  }
+
+  // ADMIN: record affiliate payout received
+  if (route === 'POST /api/admin/affiliate/record') {
+    const session = await requireAdmin(req, res, json);
+    if (!session) return true;
+    if (session.mustChange) return json(res, { error: 'Change password first' }, 403);
+    const { recordAffiliateRevenue } = require('../lib/monetization');
+    await recordAffiliateRevenue(body.affiliateId, parseFloat(body.amount), body.reference);
+    await logAdminAction(session.admin.id, 'affiliate_recorded', 'revenue', body.affiliateId, ip, { amount: body.amount });
+    return json(res, { ok: true });
+  }
+
   if (route === 'POST /api/admin/clients/create') {
     const session = await requireAdmin(req, res, json);
     if (!session) return true;
@@ -326,6 +439,33 @@ async function handle(req, res, url, body, helpers) {
   }
 
   return false; // Route not handled
+}
+
+// ============================================================
+// Revenue helpers (Owner Mode)
+// ============================================================
+function startOfTodayISO() {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d.toISOString();
+}
+function startOfMonthISO() {
+  const d = new Date();
+  return new Date(d.getFullYear(), d.getMonth(), 1).toISOString();
+}
+async function sumRevenueSince(sinceISO) {
+  try {
+    const rows = await dbList('himer_revenue_ledger', {});
+    return rows
+      .filter(r => r.created_at && r.created_at >= sinceISO)
+      .reduce((a, r) => a + parseFloat(r.amount || 0), 0);
+  } catch (_) { return 0; }
+}
+async function countActiveClients() {
+  try {
+    const clients = await dbList('himer_clients', {});
+    return clients.filter(c => c.is_active && !c.is_owner).length;
+  } catch (_) { return 0; }
 }
 
 module.exports = { handle };

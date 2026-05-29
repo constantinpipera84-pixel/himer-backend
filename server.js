@@ -13,6 +13,7 @@
  *   routes/user.js           → /api/user/*
  *   routes/admin.js          → /api/admin/*
  *   routes/client.js         → /api/client/* + /api/v1/compute
+ *   routes/business.js       → /api/business/* (v5 business API)
  *
  * Env vars (set in Render):
  *   SUPABASE_URL
@@ -44,6 +45,7 @@ const {
 const userRoutes = require('./routes/user');
 const adminRoutes = require('./routes/admin');
 const clientRoutes = require('./routes/client');
+const businessRoutes = require('./routes/business');
 
 const PORT = process.env.PORT || 8080;
 
@@ -145,7 +147,7 @@ const server = http.createServer(async (req, res) => {
 
   // Health check
   if (route === 'GET /') {
-    return res.end(`HIMER Neural Grid v4 | ${metrics.totalNodes} nodes (${metrics.activeNodes} active) | DB: ${dbIsReal ? 'Supabase' : 'memory-only'}`);
+    return res.end(`HIMER Neural Grid v5 | ${metrics.totalNodes} nodes (${metrics.activeNodes} active) | DB: ${dbIsReal ? 'Supabase' : 'memory-only'}`);
   }
 
   // Public stats
@@ -178,6 +180,17 @@ const server = http.createServer(async (req, res) => {
       contractsCompleted: n.contracts_completed || 0,
       type: n.source === 'real' ? 'verified' : 'demo',
     });
+  }
+
+  // Business API (v5) — handles its own routing
+  if (route.startsWith('GET /api/business/') || route.startsWith('POST /api/business/')) {
+    try {
+      return await businessRoutes.handle(req, res, url, body);
+    } catch (e) {
+      console.error('[Business route error]', route, e);
+      if (!res.headersSent) return json(res, { error: 'Internal server error', message: e.message }, 500);
+      return;
+    }
   }
 
   // Try sub-route handlers
@@ -251,6 +264,31 @@ function buildAdminSnapshot() {
   };
 }
 
+// ============================================================
+// COMPUTE ENGINE — node connection registry
+// ============================================================
+const compute = require('./lib/compute');
+const computeNodeConnections = new Map(); // nodeId -> ws
+
+function getActiveComputeNodeIds() {
+  const ids = [];
+  for (const [nodeId, ws] of computeNodeConnections.entries()) {
+    if (ws.readyState === 1) ids.push(nodeId);
+  }
+  return ids;
+}
+
+compute.setNodeRegistry(computeNodeConnections, getActiveComputeNodeIds);
+compute.startEngine();
+
+// Push notifications scheduler
+try {
+  const push = require('./lib/push');
+  push.startDailyReminders();
+} catch (e) {
+  console.warn('[Boot] push notifications not started:', e.message);
+}
+
 wss.on('connection', (ws) => {
   ws.send(JSON.stringify(buildPublicSnapshot()));
   ws.on('message', (msg) => {
@@ -259,8 +297,35 @@ wss.on('connection', (ws) => {
       if (data.type === 'SUBSCRIBE_USER' && data.userId) {
         ws.userId = data.userId;
       }
+      // Register this connection as a compute node (worker-capable)
+      if (data.type === 'SUBSCRIBE_NODE' && data.nodeId) {
+        ws.nodeId = data.nodeId;
+        ws.userId = data.userId || ws.userId;
+        computeNodeConnections.set(data.nodeId, ws);
+        ws.send(JSON.stringify({ type: 'NODE_REGISTERED', nodeId: data.nodeId }));
+        // Try to dispatch any pending chunks now that a new node is available
+        compute.dispatchPending();
+      }
+      // Compute chunk result from a node's worker
+      if (data.type === 'COMPUTE_RESULT') {
+        if (data.isWitness) {
+          compute.handleWitnessResult({
+            chunkId: data.chunkId, result: data.result,
+            hash: data.hash, nodeId: ws.nodeId,
+          });
+        } else {
+          compute.handleChunkResult({
+            chunkId: data.chunkId, jobId: data.jobId,
+            result: data.result, hash: data.hash,
+            nodeId: ws.nodeId, computeMs: data.computeMs,
+          });
+        }
+      }
+      if (data.type === 'COMPUTE_ERROR') {
+        // Node failed a chunk — it will be reassigned by watchdog
+        console.log(`[Compute] Node ${ws.nodeId} chunk error: ${data.error}`);
+      }
       if (data.type === 'SUBSCRIBE_ADMIN' && data.token) {
-        // Verify admin (lightweight check)
         const { verifyToken } = require('./lib/auth');
         const p = verifyToken(data.token);
         if (p && p.role === 'admin') {
@@ -269,6 +334,9 @@ wss.on('connection', (ws) => {
         }
       }
     } catch (e) {}
+  });
+  ws.on('close', () => {
+    if (ws.nodeId) computeNodeConnections.delete(ws.nodeId);
   });
 });
 
@@ -299,6 +367,9 @@ async function bootstrap() {
   // Ensure initial admin
   await ensureInitialAdmin();
 
+  // Ensure Owner business client (gets free unlimited API key for platform owner)
+  await ensureOwnerClient();
+
   // Start tick loop
   setInterval(tick, 1000);
   // Broadcast snapshot every 2s
@@ -311,8 +382,37 @@ async function bootstrap() {
     const counts = getNodeCounts();
     console.log(`[Boot] Server listening on :${PORT}`);
     console.log(`[Boot] Nodes: ${counts.real} real + ${counts.seed} seed = ${counts.total} total`);
-    console.log(`[Boot] Endpoints: /api/stats, /api/user/*, /api/admin/*, /api/client/*, /api/v1/compute`);
+    console.log(`[Boot] Endpoints: /api/stats, /api/user/*, /api/admin/*, /api/business/*, /api/client/*, /api/v1/compute`);
   });
+}
+
+async function ensureOwnerClient() {
+  try {
+    const { createClient, generateApiKey, hashApiKey } = require('./lib/business');
+    const ownerEmail = (process.env.INITIAL_ADMIN_EMAIL || process.env.OWNER_EMAIL || 'himer.nodes@gmail.com').toLowerCase();
+    const existing = (await dbList('himer_clients', { where: { email: ownerEmail } }))[0];
+    if (existing) {
+      console.log(`[Boot] Owner client exists: ${existing.id} (${existing.email})`);
+      return;
+    }
+    const { client, apiKey } = await createClient({
+      name: 'HIMER Owner',
+      email: ownerEmail,
+      company: 'HIMER',
+      country: 'RO',
+      plan: 'owner',
+      isOwner: true,
+    });
+    console.log('================================================================');
+    console.log('[Boot] OWNER API KEY CREATED — SAVE IT NOW (shown only once):');
+    console.log(`       Client ID: ${client.id}`);
+    console.log(`       API Key:   ${apiKey}`);
+    console.log(`       Email:     ${client.email}`);
+    console.log('       Use header: X-API-Key: ' + apiKey);
+    console.log('================================================================');
+  } catch (e) {
+    console.error('[Boot] Owner client setup failed (non-fatal):', e.message);
+  }
 }
 
 bootstrap().catch(e => {
