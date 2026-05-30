@@ -18,12 +18,57 @@ function newDeviceId() {
 }
 
 function deviceFingerprint(req, body = {}) {
-  // Combine: user-agent + body.fp (provided by frontend) + IP-prefix
+  // PRIMARY fingerprint: combines frontend-generated fp + UA + IP /24 subnet
   const ua = req.headers['user-agent'] || '';
   const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
-  const ipPrefix = ip.split('.').slice(0, 2).join('.'); // /16 subnet
+  const ipPrefix = ip.split('.').slice(0, 3).join('.'); // /24 subnet — tighter than /16
   const raw = (body.fp || '') + ':' + ua + ':' + ipPrefix;
   return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 24);
+}
+
+// Compute a "soft" fingerprint that survives IP changes (just FP + UA)
+function softFingerprint(req, body = {}) {
+  const ua = req.headers['user-agent'] || '';
+  const raw = (body.fp || '') + ':' + ua;
+  return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 24);
+}
+
+// Find a device for this user using multi-factor matching:
+//   1. Exact fingerprint match (best)
+//   2. Soft fingerprint match (same browser/device, IP changed)
+//   3. Hardware signature match (same CPU+RAM+screen on same UA)
+async function findExistingDevice(userId, req, body) {
+  const { dbList } = require('../lib/db');
+  if (!userId) return null;
+
+  // 1. Exact match
+  const exactFp = deviceFingerprint(req, body);
+  let device = (await dbList('himer_user_devices', { where: { user_id: userId, device_fingerprint: exactFp } }))[0];
+  if (device) return { device, matchType: 'exact', fp: exactFp };
+
+  // 2. Soft fingerprint (IP changed but browser+device stable)
+  const softFp = softFingerprint(req, body);
+  const allDevices = await dbList('himer_user_devices', { where: { user_id: userId } });
+  for (const d of allDevices) {
+    if (d.soft_fingerprint === softFp) return { device: d, matchType: 'soft', fp: exactFp };
+  }
+
+  // 3. Hardware signature: same UA + matching CPU cores + RAM tier + screen
+  const ua = req.headers['user-agent'] || '';
+  const cap = body.capacity || {};
+  const cpuCores = parseInt(cap.cpu_cores) || 0;
+  const ramTier = Math.round(parseFloat(cap.ram_gb_total) || 0); // round to nearest GB
+  const screen = body.screen || '';
+  for (const d of allDevices) {
+    if (d.user_agent === ua && 
+        parseInt(d.cpu_cores) === cpuCores && 
+        Math.round(parseFloat(d.ram_gb_total) || 0) === ramTier &&
+        d.screen_signature === screen) {
+      return { device: d, matchType: 'hardware', fp: exactFp };
+    }
+  }
+
+  return { device: null, matchType: 'none', fp: exactFp, softFp };
 }
 
 function detectDeviceName(ua) {
@@ -93,8 +138,7 @@ async function handle(req, res, url, body, helpers) {
       }
     }
 
-    // Identify or create device
-    const fp = deviceFingerprint(req, body);
+    // Identify or create device (multi-factor: exact > soft > hardware)
     const deviceName = detectDeviceName(req.headers['user-agent']);
     const cap = body.capacity || {};
     const capacityFields = {
@@ -117,14 +161,23 @@ async function handle(req, res, url, body, helpers) {
       lng: geo.lng,
       region: geo.region,
     } : {};
-    let device = (await dbList('himer_user_devices', { where: { user_id: userId, device_fingerprint: fp } }))[0];
+
+    const match = await findExistingDevice(userId, req, body);
+    const fp = match.fp;
+    const softFp = softFingerprint(req, body);
+    let device = match.device;
     let node;
     if (device) {
-      // Returning device — reactivate + refresh capacity + geo
+      // Returning device — reactivate + refresh fingerprint to latest + capacity + geo
+      console.log(`[Join] Device recognized via ${match.matchType} match: ${device.id}`);
       await dbUpdate('himer_user_devices', device.id, {
         is_online: true,
         last_seen_at: new Date().toISOString(),
         ip_address: ip,
+        device_fingerprint: fp,
+        soft_fingerprint: softFp,
+        user_agent: req.headers['user-agent'] || '',
+        screen_signature: body.screen || '',
         ...capacityFields,
         ...geoFields,
       });
@@ -144,10 +197,13 @@ async function handle(req, res, url, body, helpers) {
     } else {
       // New device
       const deviceId = newDeviceId();
+      console.log(`[Join] New device for user ${userId}: ${deviceId}`);
       device = await dbInsert('himer_user_devices', {
         id: deviceId,
         user_id: userId,
         device_fingerprint: fp,
+        soft_fingerprint: softFp,
+        screen_signature: body.screen || '',
         device_name: deviceName,
         ip_address: ip,
         user_agent: req.headers['user-agent'] || '',
@@ -227,9 +283,45 @@ async function handle(req, res, url, body, helpers) {
       recentPayouts = await dbList('himer_payouts', { where: { user_id: userId }, orderBy: 'requested_at', desc: true, limit: 10 });
     } catch (_) { recentPayouts = []; }
 
+    // ============================================================
+    // BETA: Daily report (credits earned today)
+    // ============================================================
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const yesterdayStr = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+
+    // Check if streak should reset (no checkin yesterday or today AND last checkin > yesterday)
+    let currentStreak = user.streak_days || 0;
+    if (user.last_checkin_date && user.last_checkin_date !== todayStr && user.last_checkin_date !== yesterdayStr) {
+      currentStreak = 0;
+    }
+
+    let dailyReport = { checkin: 0, ads: 0, compute: 0, streak: 0, total: 0, checkinClaimed: false, adsWatched: 0 };
+    try {
+      const todayCheckin = (await dbList('himer_daily_checkins', { where: { user_id: userId, date: todayStr } }))[0];
+      if (todayCheckin) {
+        dailyReport.checkinClaimed = true;
+        dailyReport.checkin = 10;
+        dailyReport.streak = (parseInt(todayCheckin.credits_awarded) || 10) - 10;
+      }
+      const todayAdEvents = await dbList('himer_ad_events', { where: { user_id: userId, event_type: 'rewarded_video', date: todayStr } });
+      dailyReport.adsWatched = todayAdEvents.length;
+      dailyReport.ads = todayAdEvents.length * 5;
+      // Compute credits today: simplified — based on online devices hours active today
+      dailyReport.compute = 0; // TODO: compute from heartbeats
+      dailyReport.total = dailyReport.checkin + dailyReport.ads + dailyReport.compute + dailyReport.streak;
+    } catch (e) { /* schema may not be ready */ }
+
     return json(res, {
       userId,
       email: user.email,
+      // Beta credits fields
+      creditsTotal: parseInt(user.credits_total || 0),
+      lifetimeCredits: parseInt(user.lifetime_credits || 0),
+      streakDays: currentStreak,
+      longestStreak: parseInt(user.longest_streak || 0),
+      lastCheckinDate: user.last_checkin_date,
+      dailyReport: dailyReport,
+      // Legacy fields kept for compatibility
       totalEarnings: parseFloat(user.total_earnings || 0),
       withdrawable: parseFloat(user.withdrawable || 0),
       lifetimeEarnings: parseFloat(user.lifetime_earnings || user.total_earnings || 0),
@@ -526,6 +618,114 @@ async function handle(req, res, url, body, helpers) {
       tag: 'himer-test',
     });
     return json(res, r);
+  }
+
+  // ============================================================
+  // DAILY CHECK-IN (Beta credits system)
+  // ============================================================
+  // POST /api/user/checkin — claim daily check-in credits
+  if (route === 'POST /api/user/checkin') {
+    if (!body.userId) return json(res, { error: 'userId required' }, 400);
+    const user = await dbGet('himer_users', body.userId);
+    if (!user) return json(res, { error: 'User not found' }, 404);
+
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const yesterdayStr = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+
+    // Check if already claimed today
+    const existing = (await dbList('himer_daily_checkins', { where: { user_id: body.userId, date: todayStr } }))[0];
+    if (existing) return json(res, { error: 'Already claimed today', alreadyClaimed: true });
+
+    // Calculate streak
+    let newStreak = 1;
+    let streakLost = false;
+    const lastCheckin = user.last_checkin_date;
+    if (lastCheckin === yesterdayStr) {
+      newStreak = (user.streak_days || 0) + 1;
+    } else if (lastCheckin && lastCheckin !== yesterdayStr && lastCheckin !== todayStr) {
+      streakLost = (user.streak_days || 0) > 1;
+      newStreak = 1;
+    } else {
+      newStreak = 1;
+    }
+
+    // Award credits: 10 base + streak bonuses
+    let creditsAwarded = 10;
+    let streakBonus = 0;
+    if (newStreak === 7) streakBonus = 50;
+    else if (newStreak === 30) streakBonus = 500;
+    else if (newStreak === 100) streakBonus = 2000;
+    else if (newStreak === 365) streakBonus = 10000;
+    creditsAwarded += streakBonus;
+
+    // Record check-in
+    await dbInsert('himer_daily_checkins', {
+      user_id: body.userId,
+      date: todayStr,
+      credits_awarded: creditsAwarded,
+      streak_at_claim: newStreak,
+      created_at: new Date().toISOString(),
+    });
+
+    // Update user
+    const newTotal = (user.credits_total || 0) + creditsAwarded;
+    const newLifetime = (user.lifetime_credits || 0) + creditsAwarded;
+    const newLongestStreak = Math.max(user.longest_streak || 0, newStreak);
+    await dbUpdate('himer_users', body.userId, {
+      credits_total: newTotal,
+      lifetime_credits: newLifetime,
+      streak_days: newStreak,
+      longest_streak: newLongestStreak,
+      last_checkin_date: todayStr,
+      last_active_at: new Date().toISOString(),
+    });
+
+    return json(res, {
+      ok: true,
+      creditsAwarded: creditsAwarded,
+      streakBonus: streakBonus,
+      streakDays: newStreak,
+      streakLost: streakLost,
+      newBalance: newTotal,
+    });
+  }
+
+  // POST /api/user/watch-ad — claim rewarded video credits
+  if (route === 'POST /api/user/watch-ad') {
+    if (!body.userId) return json(res, { error: 'userId required' }, 400);
+    const user = await dbGet('himer_users', body.userId);
+    if (!user) return json(res, { error: 'User not found' }, 404);
+
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const todayAds = (await dbList('himer_ad_events', { where: { user_id: body.userId, event_type: 'rewarded_video', date: todayStr } })).length;
+
+    if (todayAds >= 5) return json(res, { error: 'Daily limit reached', adsWatched: todayAds });
+
+    const creditsAwarded = 5;
+    await dbInsert('himer_ad_events', {
+      user_id: body.userId,
+      event_type: 'rewarded_video',
+      credits_awarded: creditsAwarded,
+      date: todayStr,
+      revenue_estimate: 0.05,
+      created_at: new Date().toISOString(),
+    });
+
+    const newTotal = (user.credits_total || 0) + creditsAwarded;
+    const newLifetime = (user.lifetime_credits || 0) + creditsAwarded;
+    await dbUpdate('himer_users', body.userId, {
+      credits_total: newTotal,
+      lifetime_credits: newLifetime,
+      last_active_at: new Date().toISOString(),
+    });
+
+    return json(res, {
+      ok: true,
+      creditsAwarded: creditsAwarded,
+      adsWatched: todayAds + 1,
+      adsRemaining: 5 - (todayAds + 1),
+      newBalance: newTotal,
+    });
   }
 
   return false; // Route not handled
